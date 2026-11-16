@@ -1,0 +1,9 @@
+(static-library ini
+  (version "0.1.0") (root ini)
+  (module-path "src") (module-path "../base/src")
+  (module-path "../foundation/src") (optimize 2))
+
+(executable ini-tests
+  (root ini.tests) (module-path "src") (module-path "tests")
+  (module-path "../base/src") (module-path "../foundation/src")
+  (module-path "../testing/src") (optimize 2))

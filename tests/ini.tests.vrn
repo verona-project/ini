@@ -1,0 +1,260 @@
+(import base)
+(import testing)
+(import testing :as t)
+(import allocator :as a)
+(import system_allocator :as system)
+(import arena)
+(import data :as d)
+(import error :as e)
+
+(base:variable budget u64 1000000)
+
+(base:variable live u64 0)
+
+(base:function acquire ((context (pointer void)) (size u64) (alignment u64)) a:result
+  (match (== budget 0)
+    (true (a:failure (out-of-memory)))
+    (false
+      (do
+        (assign budget (- budget 1))
+        (match (a:allocate (system:create) size alignment)
+          ((failed reason) (a:failure reason))
+          ((allocated p) (do (assign live (+ live 1)) (a:success p))))))))
+
+(base:function release ((context (pointer void)) (p (pointer u8)) (size u64) (alignment u64)) unit
+  (do (assign live (- live 1)) (a:deallocate (system:create) p size alignment)))
+
+(base:function backend () a:backend
+  (a:backend (cast (pointer void) "") acquire release))
+
+(base:function ok ((status e:status)) bool
+  (match status ((ok) true) (_ false)))
+
+(base:function append ((out (pointer d:data)) (source d:view) (at u64)) unit
+  (match (== at (field source length))
+    (true (do (d:append out #\|) unit))
+    (false
+      (do
+        (d:append out (deref (pointer-offset (field source bytes) at)))
+        (append out source (+ at 1))))))
+
+(import ini :as f)
+
+(base:function emit ((context (pointer void)) (section d:view) (key d:view) (value d:view)) unit
+  (let ((out (pointer d:data) (cast (pointer d:data) context)))
+    (do (append out section 0) (append out key 0) (append out value 0))))
+
+(base:function check-parse ((source d:view) (valid bool) (expected d:view)) t:result
+  (let
+    ((captured d:data (d:empty (system:create)))
+     (parsed f:result (f:parse source (f:visitor (cast (pointer void) (address-of captured)) emit)))
+     (checks
+       t:result
+       (t:checks
+         (t:check
+           (match valid
+             (true (ok (field parsed status)))
+             (false (base:not (ok (field parsed status))))))
+         (match valid (true (t:check (d:equal (d:borrow captured) expected))) (false (t:empty)))
+         (t:check
+           (match valid
+             (true (== (field parsed offset) (field source length)))
+             (false (<= (field parsed offset) (field source length))))))))
+    (do (d:destroy (address-of captured)) checks)))
+
+(t:test valid-empty-document
+  (check-parse (d:view "" 0) true (d:view "" 0)))
+
+(t:test valid-comments
+  (check-parse (d:view "# comment\n; comment\n" 20) true (d:view "" 0)))
+
+(t:test valid-global-entry
+  (check-parse (d:view "key=value" 9) true (d:view "|key|value|" 11)))
+
+(t:test valid-sections-and-trimming
+  (let
+    ((fixture-0
+       (array u8 46)
+       (array-of
+         #\space
+         #\x
+         #\space
+         #\=
+         #\space
+         #\y
+         #\space
+         #\return
+         #\newline
+         #\[
+         #\space
+         #\s
+         #\e
+         #\r
+         #\v
+         #\e
+         #\r
+         #\space
+         #\]
+         #\newline
+         #\space
+         #\h
+         #\o
+         #\s
+         #\t
+         #\space
+         #\=
+         #\space
+         #\l
+         #\o
+         #\c
+         #\a
+         #\l
+         #\h
+         #\o
+         #\s
+         #\t
+         #\newline
+         #\p
+         #\o
+         #\r
+         #\t
+         #\=
+         #\8
+         #\0
+         #\newline)))
+    (check-parse
+      (d:view (address-of (index fixture-0 0)) 46)
+      true
+      (d:view "|x|y|server|host|localhost|server|port|80|" 42))))
+
+(t:test valid-empty-value-and-literal-comment
+  (check-parse
+    (d:view "x=\nx=two=three #literal\n" 24)
+    true
+    (d:view "|x|||x|two=three #literal|" 26)))
+
+(t:test valid-duplicate-entries
+  (check-parse (d:view "[a]\nx=1\n[a]\nx=2" 15) true (d:view "a|x|1|a|x|2|" 12)))
+
+(t:test valid-unicode-and-cr-lines
+  (let
+    ((fixture-1 (array u8 8) (array-of #\x #\= 195 169 #\return #\y #\= #\z))
+     (fixture-2 (array u8 11) (array-of #\| #\x #\| 195 169 #\| #\| #\y #\| #\z #\|)))
+    (check-parse
+      (d:view (address-of (index fixture-1 0)) 8)
+      true
+      (d:view (address-of (index fixture-2 0)) 11))))
+
+(t:test invalid-missing-equals
+  (check-parse (d:view "missing" 7) false (d:view "" 0)))
+
+(t:test invalid-unclosed-section
+  (check-parse (d:view "[unclosed" 9) false (d:view "" 0)))
+
+(t:test invalid-empty-section
+  (check-parse (d:view "[]" 2) false (d:view "" 0)))
+
+(t:test invalid-section-suffix
+  (check-parse (d:view "[x] extra" 9) false (d:view "" 0)))
+
+(t:test invalid-empty-key
+  (check-parse (d:view "=x" 2) false (d:view "" 0)))
+
+(t:test invalid-nested-brackets
+  (check-parse (d:view "[a[b]\nx=y" 9) false (d:view "" 0)))
+
+(t:test invalid-nul-byte
+  (let ((fixture-3 (array u8 3) (array-of #\x #\= 0)))
+    (check-parse (d:view (address-of (index fixture-3 0)) 3) false (d:view "" 0))))
+
+(t:test invalid-utf8
+  (let ((byte u8 255)) (check-parse (d:view (address-of byte) 1) false (d:view "" 0))))
+
+(t:test writer
+  (let
+    ((fixture-4 (array u8 2) (array-of 195 169))
+     (fixture-5
+       (array u8 17)
+       (array-of #\[ #\s #\e #\r #\v #\e #\r #\] #\newline #\h #\o #\s #\t #\= 195 169 #\newline)))
+    (let
+      ((owner arena:arena (arena:create (system:create) 64))
+       (out d:data (d:empty (arena:allocator (address-of owner))))
+       (status
+         e:status
+         (do
+           (f:write-section (d:view "server" 6) (address-of out))
+           (f:write-entry
+             (d:view "host" 4)
+             (d:view (address-of (index fixture-4 0)) 2)
+             (address-of out))))
+       (checks
+         t:result
+         (t:checks
+           (t:check (ok status))
+           (t:check (d:equal (d:borrow out) (d:view (address-of (index fixture-5 0)) 17))))))
+      (do (d:destroy (address-of out)) (arena:destroy (address-of owner)) checks))))
+
+(t:test writer-allocation-failure
+  (do
+    (assign budget 1000)
+    (let ((out d:data (d:empty (backend))) (seed e:status (d:append (address-of out) #\x)))
+      (do
+        (assign budget 0)
+        (let
+          ((status
+             e:status
+             (f:write-entry
+               (d:view "key" 3)
+               (d:view "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" 40)
+               (address-of out)))
+           (checks
+             t:result
+             (t:checks
+               (t:check (match status ((allocation-error _) true) (_ false)))
+               (t:check (d:equal (d:borrow out) (d:view "x" 1))))))
+          (do
+            (d:destroy (address-of out))
+            (assign budget 1000000)
+            (t:checks checks (t:check (== live 0)))))))))
+
+(t:test exact-error-offset
+  (let
+    ((captured d:data (d:empty (system:create)))
+     (parsed
+       f:result
+       (f:parse
+         (d:view "x=y\nbroken" 10)
+         (f:visitor (cast (pointer void) (address-of captured)) emit))))
+    (do (d:destroy (address-of captured)) (t:check (== (field parsed offset) 4)))))
+
+(t:test writer-rejects-ambiguous-input
+  (let
+    ((out d:data (d:empty (system:create)))
+     (status e:status (f:write-entry (d:view "#key" 4) (d:view "x" 1) (address-of out)))
+     (checks
+       t:result
+       (t:checks
+         (t:check (match status ((invalid-input) true) (_ false)))
+         (t:check (== (d:length out) 0)))))
+    (do (d:destroy (address-of out)) checks)))
+
+(t:runner main
+  (exact-error-offset)
+  (writer-rejects-ambiguous-input)
+  (valid-empty-document)
+  (valid-comments)
+  (valid-global-entry)
+  (valid-sections-and-trimming)
+  (valid-empty-value-and-literal-comment)
+  (valid-duplicate-entries)
+  (valid-unicode-and-cr-lines)
+  (invalid-missing-equals)
+  (invalid-unclosed-section)
+  (invalid-empty-section)
+  (invalid-section-suffix)
+  (invalid-empty-key)
+  (invalid-nested-brackets)
+  (invalid-nul-byte)
+  (invalid-utf8)
+  (writer)
+  (writer-allocation-failure))

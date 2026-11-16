@@ -1,0 +1,200 @@
+(import base)
+(import allocator)
+(import data :as d)
+(import error :as e)
+(import string :as s)
+
+; Widen character literals explicitly for u64 comparisons and arithmetic.
+(base:function char-code ((character u8)) u64
+  (base:convert character))
+
+(base:type result (product (status e:status) (offset u64)))
+
+; EOF is distinct from every possible input byte.
+(base:constant end-of-input u64 256)
+
+(base:function byte-at ((source d:view) (at u64)) u64
+  (match (< at (field source length))
+    (true (base:convert (deref (pointer-offset (field source bytes) at))))
+    (false end-of-input)))
+
+(base:function span ((source d:view) (start u64) (end u64)) d:view
+  (d:view (pointer-offset (field source bytes) start) (- end start)))
+
+(base:type visitor
+  (product
+    (context (pointer void))
+    (emit (pointer (function ((pointer void) d:view d:view d:view) unit)))))
+
+(base:function space ((c u64)) bool
+  (base:or (== c (char-code #\space)) (== c (char-code #\tab))))
+
+(base:function trim-start ((source d:view) (at u64) (end u64)) u64
+  (match (base:and (< at end) (space (byte-at source at)))
+    (true (trim-start source (+ at 1) end))
+    (false at)))
+
+(base:function trim-end ((source d:view) (start u64) (end u64)) u64
+  (match (> end start)
+    (false end)
+    (true
+      (match (space (byte-at source (- end 1)))
+        (true (trim-end source start (- end 1)))
+        (false end)))))
+
+(base:function line-end ((source d:view) (at u64)) u64
+  (match
+    (base:or
+      (== (byte-at source at) end-of-input)
+      (== (byte-at source at) (char-code #\newline))
+      (== (byte-at source at) (char-code #\return)))
+    (true at)
+    (false (line-end source (+ at 1)))))
+
+(base:function find-equal ((source d:view) (at u64) (end u64)) u64
+  (match (base:or (== at end) (== (byte-at source at) (char-code #\=)))
+    (true at)
+    (false (find-equal source (+ at 1) end))))
+
+(base:function contains ((source d:view) (at u64) (c u64)) bool
+  (match (== at (field source length))
+    (true false)
+    (false (match (== (byte-at source at) c) (true true) (false (contains source (+ at 1) c))))))
+
+(base:function lines ((source d:view) (at u64) (section d:view) (sink visitor)) result
+  (match (== at (field source length))
+    (true (result (e:success) at))
+    (false
+      (let
+        ((end u64 (line-end source at))
+         (start u64 (trim-start source at end))
+         (finish u64 (trim-end source start end))
+         (c u64 (byte-at source start))
+         (next
+           u64
+           (base:cond
+             ((== end (field source length)) end)
+             ((base:and
+                (== (byte-at source end) (char-code #\return))
+                (== (byte-at source (+ end 1)) (char-code #\newline)))
+              (+ end 2))
+             (true (+ end 1)))))
+        (base:cond
+          ((base:or (== start finish) (== c (char-code #\;)) (== c (char-code #\#)))
+           (lines source next section sink))
+          ((== c (char-code #\[))
+           (match (== (byte-at source (- finish 1)) (char-code #\]))
+             (false (result (e:invalid) start))
+             (true
+               (let
+                 ((name-start u64 (trim-start source (+ start 1) (- finish 1)))
+                  (name-end u64 (trim-end source name-start (- finish 1)))
+                  (name d:view (span source name-start name-end)))
+                 (match
+                   (base:or
+                     (== name-start name-end)
+                     (contains name 0 (char-code #\]))
+                     (contains name 0 (char-code #\[)))
+                   (true (result (e:invalid) start))
+                   (false (lines source next name sink)))))))
+          (true
+            (let
+              ((equal u64 (find-equal source start finish))
+               (key-end u64 (trim-end source start equal)))
+              (match (base:or (== equal finish) (== key-end start))
+                (true (result (e:invalid) start))
+                (false
+                  (let
+                    ((value-start u64 (trim-start source (+ equal 1) finish))
+                     (f
+                       (pointer (function ((pointer void) d:view d:view d:view) unit))
+                       (field sink emit)))
+                    (do
+                      (f
+                        (field sink context)
+                        section
+                        (span source start key-end)
+                        (span source value-start finish))
+                      (lines source next section sink))))))))))))
+
+;; Strict simple INI: ASCII trim, whole-line comments, literal values, no interpolation.
+(base:function parse ((source d:view) (sink visitor)) result
+  (match (s:validate source)
+    ((tuple false _) (result (e:invalid) 0))
+    ((tuple valid _)
+     (match (contains source 0 0)
+       (true (result (e:invalid) 0))
+       (false (lines source 0 (d:view "" 0) sink))))))
+
+(base:function text-valid ((source d:view)) bool
+  (base:and
+    (tuple-get (s:validate source) 0)
+    (base:not (contains source 0 0))
+    (base:not (contains source 0 (char-code #\newline)))
+    (base:not (contains source 0 (char-code #\return)))
+    (== (trim-start source 0 (field source length)) 0)
+    (== (trim-end source 0 (field source length)) (field source length))))
+
+(base:function append-view ((source d:view) (at u64) (out (pointer d:data))) unit
+  (match (== at (field source length))
+    (true unit)
+    (false (do (d:append out (base:convert (byte-at source at))) (append-view source (+ at 1) out)))))
+
+;; Append a section header or entry. Inputs must already be trimmed.
+(base:function write-section ((name d:view) (out (pointer d:data))) e:status
+  (match
+    (base:and
+      (text-valid name)
+      (> (field name length) 0)
+      (base:not (contains name 0 (char-code #\[)))
+      (base:not (contains name 0 (char-code #\]))))
+    (false (e:invalid))
+    (true
+      (match (allocator:checked-add-size (d:length (deref out)) (field name length))
+        ((tuple false _) (e:too-large))
+        ((tuple valid total)
+         (match (allocator:checked-add-size total 3)
+           ((tuple false _) (e:too-large))
+           ((tuple valid capacity)
+            (match (d:reserve out capacity)
+              ((ok)
+               (do
+                 (d:append out #\[)
+                 (append-view name 0 out)
+                 (d:append out #\])
+                 (d:append out #\newline)
+                 (e:success)))
+              (reason reason)))))))))
+
+(base:function write-entry ((key d:view) (value d:view) (out (pointer d:data))) e:status
+  (match
+    (base:and
+      (text-valid key)
+      (text-valid value)
+      (> (field key length) 0)
+      (base:not (contains key 0 (char-code #\=)))
+      (base:not (== (byte-at key 0) (char-code #\[)))
+      (base:not (== (byte-at key 0) (char-code #\;)))
+      (base:not (== (byte-at key 0) (char-code #\#))))
+    (false (e:invalid))
+    (true
+      (match (allocator:checked-add-size (field key length) (field value length))
+        ((tuple false _) (e:too-large))
+        ((tuple valid size)
+         (match (allocator:checked-add-size size 2)
+           ((tuple false _) (e:too-large))
+           ((tuple valid line)
+            (match (allocator:checked-add-size line (d:length (deref out)))
+              ((tuple false _) (e:too-large))
+              ((tuple valid capacity)
+               (match (d:reserve out capacity)
+                 ((ok)
+                  (do
+                    (append-view key 0 out)
+                    (d:append out #\=)
+                    (append-view value 0 out)
+                    (d:append out #\newline)
+                    (e:success)))
+                 (reason reason)))))))))))
+
+(export result visitor parse write-section write-entry)
